@@ -50,9 +50,10 @@ class ParseMetricService(BaseModuleService):
         return round(rate, 4), quarantined, total_rows
 
     def real_fallback_rate(self, channel: str) -> tuple[float, int, int]:
-        """回退率来自解析路由的真实回退计数。
+        """回退率来自持久化回退运行记录的真实结算，不做估算。
 
-        返回 (回退率, 发生回退的决策数, 决策总数)。
+        返回 (回退率, 发生回退的决策数, 决策总数)。有运行台账的决策按台账中
+        已采用回执的实际解析器序号结算；无成功凭据的尝试不能把批次写成成功。
         """
         intake_batches = {
             str(r.get("批次编号")) for r in store.rows("file_intake")
@@ -62,9 +63,40 @@ class ParseMetricService(BaseModuleService):
             r for r in store.rows("parser_route")
             if str(r.get("关联批次")) in intake_batches
         ]
-        fallbacks = sum(1 for r in decisions if self._int(r, "回退次数") > 0)
+        from app.services import SERVICES as _SERVICES
+        route_svc = _SERVICES.get("parser_route")
+        fallbacks = 0
+        for row in decisions:
+            decision_no = str(row.get("决策编号"))
+            if route_svc is not None and route_svc._runs(decision_no):
+                count = route_svc.ledger_fallback_count(decision_no)
+            else:
+                count = self._int(row, "回退次数")
+            if count > 0:
+                fallbacks += 1
         rate = fallbacks / len(decisions) if decisions else 0.0
         return round(rate, 4), fallbacks, len(decisions)
+
+    def trace_runs(self, reading_no: str) -> list[dict[str, Any]]:
+        """指标复核页从采用结果回到对应的实际执行记录（回退运行台账）。"""
+        row = next(
+            (r for r in store.rows(self.MODULE)
+             if r.get("指标读数编号") == reading_no), None)
+        if row is None:
+            return []
+        channel = str(row.get("来源渠道") or "")
+        intake_batches = {
+            str(r.get("批次编号")) for r in store.rows("file_intake")
+            if r.get("来源渠道") == channel
+        }
+        decision_nos = {
+            str(r.get("决策编号")) for r in store.rows("parser_route")
+            if str(r.get("关联批次")) in intake_batches
+        }
+        return [
+            dict(run) for run in store.rows("fallback_run")
+            if str(run.get("决策编号")) in decision_nos
+        ]
 
     def settle_reading(self, reading_no: str, window: str, channel: str,
                        collected_at: str) -> tuple[bool, str, dict[str, Any] | None]:
@@ -89,6 +121,23 @@ class ParseMetricService(BaseModuleService):
         quarantine_rate, quarantined, total_rows = self.real_quarantine_rate(channel)
         fallback_rate, fallbacks, decisions = self.real_fallback_rate(channel)
 
+        # 无成功凭据的尝试不能把批次写成成功：台账里已采用回执覆盖的决策才计成功
+        from app.services import SERVICES as _SERVICES
+        route_svc = _SERVICES.get("parser_route")
+        channel_decision_nos = [
+            str(r.get("决策编号")) for r in store.rows("parser_route")
+            if str(r.get("关联批次")) in intake_batches
+        ]
+        adopted_count = 0
+        run_count = 0
+        if route_svc is not None:
+            adopted_set = route_svc.successful_decisions()
+            adopted_count = sum(1 for no in channel_decision_nos if no in adopted_set)
+            run_count = sum(
+                1 for run in store.rows("fallback_run")
+                if str(run.get("决策编号")) in set(channel_decision_nos)
+            )
+
         rows = store.rows(self.MODULE)
         target = next((r for r in rows if r.get("指标读数编号") == reading_no), None)
         if target is None:
@@ -107,6 +156,8 @@ class ParseMetricService(BaseModuleService):
             "批次总行计数": str(total_rows),
             "回退决策计数": str(fallbacks),
             "路由决策计数": str(decisions),
+            "回退运行记录数": str(run_count),
+            "成功凭据决策数": str(adopted_count),
             "status": "已结算",
             "pending": False,
             "abnormal": False,
@@ -150,8 +201,24 @@ class ParseMetricService(BaseModuleService):
                 f"读数 {reading_no} 隔离率 {recorded_rate:.4f} "
                 f"与真实计数 {rate:.4f}（{quarantined}/{total_rows}）不一致"
             )
+
+        # 回退率必须与持久化回退运行记录的结算读数一致
+        fb_rate, fb_decisions, total_decisions = self.real_fallback_rate(channel)
+        recorded_fb = self._int(row, "回退决策计数")
+        if recorded_fb != fb_decisions:
+            return False, (
+                f"读数 {reading_no} 记录的回退决策 {recorded_fb} "
+                f"与回退运行台账结算 {fb_decisions} 不一致，读数不得结算"
+            )
+        recorded_fb_rate = self._float(row, "回退率")
+        if abs(recorded_fb_rate - fb_rate) > 0.0001:
+            return False, (
+                f"读数 {reading_no} 回退率 {recorded_fb_rate:.4f} "
+                f"与台账真实结算 {fb_rate:.4f}（{fb_decisions}/{total_decisions}）不一致"
+            )
         return True, (
-            f"读数 {reading_no} 与真实计数一致：隔离 {quarantined}/{total_rows} = {rate:.4f}"
+            f"读数 {reading_no} 与真实计数一致：隔离 {quarantined}/{total_rows} = {rate:.4f}，"
+            f"回退 {fb_decisions}/{total_decisions} = {fb_rate:.4f}（可追溯 {len(self.trace_runs(reading_no))} 条运行回执）"
         )
 
     def channel_throughput(self) -> dict[str, int]:

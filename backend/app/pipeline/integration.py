@@ -629,6 +629,41 @@ class ParsePipelineOrchestrator:
 
         ok, msg, decision = self.route.execute_with_fallback(
             decision_id, try_parse, decide_time)
+        # 引擎层每次尝试同步到持久化回退运行台账，恢复与指标结算都读这份记录
+        if decision is not None:
+            for offset, attempt in enumerate(decision.attempts):
+                existing = next(
+                    (r for r in store.rows("fallback_run")
+                     if r.get("决策编号") == decision_id
+                     and r.get("实际解析器") == attempt.parser
+                     and r.get("输入凭据") == attempt.input_credential),
+                    None,
+                )
+                if existing is not None:
+                    continue
+                state = attempt.confirm_state
+                run_row = _append_row("fallback_run", {
+                    "运行回执编号": attempt.receipt_no,
+                    "决策编号": decision_id,
+                    "关联批次": batch_id,
+                    "实际解析器": attempt.parser,
+                    "回退序号": str(offset),
+                    "输入凭据": attempt.input_credential,
+                    "解析行数": str(attempt.row_count),
+                    "确认状态": state,
+                    "产出字段": attempt.output_fields,
+                    "迟到标记": "是" if attempt.late else "否",
+                    "尝试时间": attempt.attempt_time or decide_time,
+                    "确认时间": decide_time if state in ("已确认",) else "",
+                    "失败原因": attempt.failure_reason,
+                }, status=state,
+                    pending=state == "待核对",
+                    abnormal=not attempt.success)
+                if attempt.success and decision.selected_parser == attempt.parser:
+                    run_row["确认状态"] = "已采用"
+                    run_row["status"] = "已采用"
+                    run_row["pending"] = False
+                    run_row["确认时间"] = decide_time
         _append_row("parser_route", {
             "决策编号": decision_id, "关联批次": batch_id,
             "推断格式": resolved_format,

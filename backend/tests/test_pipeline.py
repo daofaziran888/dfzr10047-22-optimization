@@ -2507,3 +2507,305 @@ class TestIntakeAuditAndServices:
         assert audits[-1]["变更后值"] == "探测格式xlsx"
         snap = audit_svc.domain_snapshot()
         assert snap["count"] >= 6
+
+
+# ======================================================================
+# 回退运行台账可靠性：持久化回执、恢复核对、迟到确认、唯一采用、指标追溯
+# ======================================================================
+class TestFallbackRunLedger:
+    def _route(self, decision_no="PR-LATE", batch="FI-LEDGER-1"):
+        svc = SERVICES["parser_route"]
+        rows = store.rows("parser_route")
+        rows.append({
+            "id": max(int(r["id"]) for r in rows) + 1,
+            "status": "已选定", "pending": False, "abnormal": False,
+            "决策编号": decision_no, "关联批次": batch,
+            "推断格式": "csv-utf8", "命中解析器": "csv_parser_v2",
+            "备选解析器": "csv_parser_v1,generic_delimiter",
+            "路由依据": "台账恢复场景", "回退次数": "0", "决策时间": "t0",
+        })
+        return svc
+
+    def test_late_p2_then_recover_with_p3_keeps_single_adopted_product(self, fresh_store):
+        """首选失败后 P2 产出 7 行但迟回，恢复时再申请 P3 的 8 行，只采用一份。"""
+        svc = self._route()
+        # 首选 P1 失败，原输入保留在失败尝试里
+        ok, msg, p1 = svc.submit_attempt(
+            "PR-LATE", "csv_parser_v2", "cred:p1#v1", False, "", 0, "t1",
+            failure_reason="首选解析器空指针")
+        assert ok and p1["确认状态"] == "已失败"
+        # P2 同批备选完成解析输出 7 行，但回执迟到，先落「待核对」
+        ok, _msg, p2 = svc.submit_attempt(
+            "PR-LATE", "csv_parser_v1", "cred:p2#v1", True,
+            "order_id,amount", 7, "t2")
+        assert p2["确认状态"] == "待核对"
+        assert p2["解析行数"] == "7"
+
+        # 恢复时服务端先核对已执行解析器与迟到结果
+        ok, _msg, view = svc.reconcile_decision("PR-LATE")
+        assert {r["实际解析器"] for r in view["已产出待核对"]} == {"csv_parser_v1"}
+        assert view["尚未执行备选"] == ["generic_delimiter"]
+        assert view["失败尝试"][0]["输入凭据"] == "cred:p1#v1"
+
+        # 值班员从原决策继续，申请另一份已配置备选 P3 的 8 行
+        ok, _msg, p3 = svc.submit_attempt(
+            "PR-LATE", "generic_delimiter", "cred:p3#v1", True,
+            "order_id,amount,buyer", 8, "t3")
+        assert ok and p3["解析行数"] == "8"
+
+        # P2 迟到确认只核对原回执，不重新执行
+        ok, _msg, confirmed_p2 = svc.confirm_run(p2["运行回执编号"], "t4", late=True)
+        assert confirmed_p2["确认状态"] == "已确认"
+        assert confirmed_p2["迟到标记"] == "是"
+
+        # 并发提交 P2/P3 时只确认一份实际字段：采用 P3
+        ok, _msg, adopted = svc.adopt_run("PR-LATE", p3["运行回执编号"], "t5")
+        assert adopted["确认状态"] == "已采用"
+        # P2 的迟到成功回执被搁置，不覆盖唯一产物
+        refreshed_p2 = svc._find_run(p2["运行回执编号"])
+        assert refreshed_p2["确认状态"] == "已搁置"
+
+        decision = svc._find("PR-LATE")
+        assert decision["命中解析器"] == "generic_delimiter"
+        assert decision["回退次数"] == "2"
+        assert decision["status"] == "已回退"
+
+    def test_duplicate_submit_same_credential_is_idempotent(self, fresh_store):
+        """重复提交同解析器同输入凭据不再执行、不累加回退次数。"""
+        svc = self._route(decision_no="PR-IDEM", batch="FI-LEDGER-2")
+        ok, _m, first = svc.submit_attempt(
+            "PR-IDEM", "csv_parser_v2", "cred:same#1", True, "a,b", 5, "t1")
+        ok2, _m2, second = svc.submit_attempt(
+            "PR-IDEM", "csv_parser_v2", "cred:same#1", True, "a,b", 5, "t2")
+        assert ok2 is True
+        assert second["运行回执编号"] == first["运行回执编号"]
+        runs = svc._runs("PR-IDEM")
+        assert len(runs) == 1
+        # 不同输入凭据视为新的合法重试，使用各自凭据
+        ok3, _m3, third = svc.submit_attempt(
+            "PR-IDEM", "csv_parser_v2", "cred:same#2", False, "", 0, "t3",
+            failure_reason="换输入后仍失败")
+        assert ok3 is True
+        assert len(svc._runs("PR-IDEM")) == 2
+        assert third["确认状态"] == "已失败"
+
+    def test_adopted_attempt_counts_once_and_blocks_other_adoption(self, fresh_store):
+        svc = self._route(decision_no="PR-ONCE", batch="FI-LEDGER-3")
+        _ok, _m, p2 = svc.submit_attempt(
+            "PR-ONCE", "csv_parser_v1", "cred:once#1", True, "a", 7, "t1")
+        svc.confirm_run(p2["运行回执编号"], "t2")
+        ok, _m, adopted = svc.adopt_run("PR-ONCE", p2["运行回执编号"], "t3")
+        assert ok and adopted["确认状态"] == "已采用"
+        # 重复采用同一回执幂等
+        ok2, _m2, again = svc.adopt_run("PR-ONCE", p2["运行回执编号"], "t4")
+        assert ok2 and again["运行回执编号"] == p2["运行回执编号"]
+        # 已采用后其他解析器的新尝试被拒绝
+        ok3, msg3, _r = svc.submit_attempt(
+            "PR-ONCE", "generic_delimiter", "cred:once#2", True, "a,b", 8, "t5")
+        assert ok3 is False
+        assert "已采用" in msg3
+
+    def test_no_success_credential_keeps_batch_from_success(self, fresh_store):
+        """无成功凭据的尝试不能把批次写成成功，回退次数按实际尝试结算。"""
+        svc = self._route(decision_no="PR-NOCRED", batch="FI-LEDGER-4")
+        svc.submit_attempt("PR-NOCRED", "csv_parser_v2", "c#1", False, "", 0, "t1", failure_reason="e1")
+        svc.submit_attempt("PR-NOCRED", "csv_parser_v1", "c#2", False, "", 0, "t2", failure_reason="e2")
+        assert svc.ledger_fallback_count("PR-NOCRED") == 2
+        assert svc.successful_decisions().isdisjoint({"PR-NOCRED"})
+        decision = svc._find("PR-NOCRED")
+        assert decision["status"] != "已回退"
+        # 失败回执不能被确认成成功
+        failed_receipt = svc._runs("PR-NOCRED")[0]["运行回执编号"]
+        ok, msg, _r = svc.confirm_run(failed_receipt, "t3")
+        assert ok is False and "失败" in msg
+
+    def test_unknown_parser_and_empty_credential_rejected(self, fresh_store):
+        svc = self._route(decision_no="PR-GUARD", batch="FI-LEDGER-5")
+        ok, msg, _r = svc.submit_attempt(
+            "PR-GUARD", "parser_not_configured", "c#1", True, "a", 1, "t1")
+        assert ok is False and "解析器链" in msg
+        ok2, msg2, _r2 = svc.submit_attempt(
+            "PR-GUARD", "csv_parser_v1", " ", True, "a", 1, "t1")
+        assert ok2 is False and "输入凭据" in msg2
+
+    def test_run_with_fallback_writes_persistent_ledger(self, fresh_store):
+        svc = SERVICES["parser_route"]
+        svc.choose_by_probe("PR-LED", "FI-20260901001", "FP-001", "t")
+        ok, msg, decision = svc.run_with_fallback(
+            "PR-LED", lambda p: p == "csv_parser_v1", "t2")
+        assert ok is True and decision["回退次数"] == "1"
+        runs = svc._runs("PR-LED")
+        assert [r["实际解析器"] for r in runs] == ["csv_parser_v2", "csv_parser_v1"]
+        assert runs[0]["确认状态"] == "已失败"
+        assert runs[1]["确认状态"] == "已采用"
+        # 每个尝试保留各自输入凭据
+        assert runs[0]["输入凭据"] != runs[1]["输入凭据"]
+        # 再跑一次不会重复登记
+        ok2, _m2, _d2 = svc.run_with_fallback(
+            "PR-LED", lambda p: p == "csv_parser_v1", "t3")
+        assert ok2 is True
+        assert len(svc._runs("PR-LED")) == 2
+
+    def test_metric_settles_from_persisted_runs_and_trace_back(self, fresh_store):
+        """指标用持久化回退运行记录结算，复核页可从采用结果回到执行记录。"""
+        svc = self._route(decision_no="PR-METRIC", batch="FI-20260901001")
+        _ok, _m, p2 = svc.submit_attempt(
+            "PR-METRIC", "csv_parser_v2", "m#1", False, "", 0, "t1", failure_reason="e")
+        _ok, _m, p3 = svc.submit_attempt(
+            "PR-METRIC", "csv_parser_v1", "m#2", True, "a,b", 7, "t2")
+        svc.confirm_run(p3["运行回执编号"], "t3")
+        svc.adopt_run("PR-METRIC", p3["运行回执编号"], "t4")
+
+        metric_svc = SERVICES["parse_metric"]
+        ok, msg, reading = metric_svc.settle_reading(
+            "PM-LEDGER", "20260905", "sftp-node-03", "t5")
+        assert ok is True
+        assert reading["回退运行记录数"] != "0"
+        assert reading["成功凭据决策数"] != "0"
+        # 交叉核对与台账一致
+        ok2, msg2 = metric_svc.cross_check("PM-LEDGER")
+        assert ok2 is True and "运行回执" in msg2
+        # 复核页追溯到实际执行记录（含 seed 与本次台账）
+        traced = metric_svc.trace_runs("PM-LEDGER")
+        parsers = {r["实际解析器"] for r in traced}
+        assert {"csv_parser_v2", "csv_parser_v1"}.issubset(parsers)
+        adopted = [r for r in traced if r["确认状态"] == "已采用"]
+        assert any(r["运行回执编号"] == p3["运行回执编号"] for r in adopted)
+        assert len(adopted) >= 1
+
+    def test_reconcile_separates_pending_and_not_started(self, fresh_store):
+        svc = self._route(decision_no="PR-VIEW", batch="FI-LEDGER-6")
+        svc.submit_attempt("PR-VIEW", "csv_parser_v2", "v#1", False, "", 0, "t1", failure_reason="e")
+        svc.submit_attempt("PR-VIEW", "csv_parser_v1", "v#2", True, "a", 3, "t2")
+        ok, _msg, view = svc.reconcile_decision("PR-VIEW")
+        assert ok is True
+        assert len(view["已产出待核对"]) == 1
+        assert len(view["失败尝试"]) == 1
+        assert view["尚未执行备选"] == ["generic_delimiter"]
+        assert view["可继续尝试"] is True
+
+    def test_late_confirm_after_adoption_is_superseded(self, fresh_store):
+        svc = self._route(decision_no="PR-SUPER", batch="FI-LEDGER-7")
+        _ok, _m, p2 = svc.submit_attempt(
+            "PR-SUPER", "csv_parser_v1", "s#1", True, "a", 7, "t1")
+        _ok, _m, p3 = svc.submit_attempt(
+            "PR-SUPER", "generic_delimiter", "s#2", True, "a,b", 8, "t2")
+        svc.confirm_run(p3["运行回执编号"], "t3")
+        svc.adopt_run("PR-SUPER", p3["运行回执编号"], "t4")
+        # P2 此时才迟到确认
+        ok, msg, late_run = svc.confirm_run(p2["运行回执编号"], "t5", late=True)
+        assert ok is True
+        assert late_run["确认状态"] == "已搁置"
+        assert "迟到" in msg
+        assert svc._adopted_run("PR-SUPER")["运行回执编号"] == p3["运行回执编号"]
+
+    def test_chain_snapshot_keeps_fallback_count_after_adoption_rewrite(self, fresh_store):
+        """采用 P3 改写命中解析器后，链快照仍保证台账回退次数按原链序号结算。"""
+        svc = self._route(decision_no="PR-SNAP", batch="FI-LEDGER-8")
+        _ok, _m, p1 = svc.submit_attempt(
+            "PR-SNAP", "csv_parser_v2", "snap#1", False, "", 0, "t1", failure_reason="e")
+        _ok, _m, p2 = svc.submit_attempt(
+            "PR-SNAP", "csv_parser_v1", "snap#2", True, "a", 7, "t2")
+        _ok, _m, p3 = svc.submit_attempt(
+            "PR-SNAP", "generic_delimiter", "snap#3", True, "a,b", 8, "t3")
+        svc.adopt_run("PR-SNAP", p3["运行回执编号"], "t4")
+        decision = svc._find("PR-SNAP")
+        # 命中解析器已被改写成实际采用的 P3
+        assert decision["命中解析器"] == "generic_delimiter"
+        # 链快照保留原始 P1/P2/P3 顺序
+        assert svc._chain_of(decision) == [
+            "csv_parser_v2", "csv_parser_v1", "generic_delimiter"]
+        assert svc.ledger_fallback_count("PR-SNAP") == 2
+        ok, _msg, view = svc.reconcile_decision("PR-SNAP")
+        assert ok and view["台账回退次数"] == 2
+        # 旧尝试与失败输入仍然保留
+        assert {r["运行回执编号"] for r in view["全部运行回执"]} == {
+            p1["运行回执编号"], p2["运行回执编号"], p3["运行回执编号"]}
+
+
+class TestFallbackRunHTTP:
+    """路由层分派测试：锁定环境无 httpx，直接调用路由函数覆盖参数校验与返回结构。"""
+
+    def test_http_reconcile_attempt_confirm_adopt_flow(self, fresh_store):
+        from app.routers import fallback_run as fb_router
+        from app.routers.fallback_run import AttemptPayload, ConfirmPayload
+
+        rows = store.rows("parser_route")
+        rows.append({
+            "id": max(int(r["id"]) for r in rows) + 1,
+            "status": "已选定", "pending": False, "abnormal": False,
+            "决策编号": "PR-HTTP", "关联批次": "FI-HTTP-1",
+            "推断格式": "csv-utf8", "命中解析器": "csv_parser_v2",
+            "备选解析器": "csv_parser_v1", "路由依据": "http",
+            "回退次数": "0", "决策时间": "t0",
+        })
+
+        result = fb_router.submit_attempt("PR-HTTP", AttemptPayload(
+            parser="csv_parser_v2", input_credential="h#1", success=False,
+            row_count=0, attempt_time="t1", failure_reason="boom"))
+        assert result.ok is True
+        assert result.entry["确认状态"] == "已失败"
+
+        result = fb_router.submit_attempt("PR-HTTP", AttemptPayload(
+            parser="csv_parser_v1", input_credential="h#2", success=True,
+            output_fields="a,b", row_count=7, attempt_time="t2"))
+        assert result.ok is True and result.entry["确认状态"] == "待核对"
+        receipt = result.entry["运行回执编号"]
+
+        # 幂等：同凭据重复提交
+        again = fb_router.submit_attempt("PR-HTTP", AttemptPayload(
+            parser="csv_parser_v1", input_credential="h#2", success=True,
+            output_fields="a,b", row_count=7, attempt_time="t2"))
+        assert again.entry["运行回执编号"] == receipt
+
+        view = fb_router.reconcile("PR-HTTP")
+        assert view.entry["尚未执行备选"] == []
+        assert len(view.entry["失败尝试"]) == 1
+
+        confirmed = fb_router.confirm_run(
+            receipt, ConfirmPayload(confirm_time="t3", late=True))
+        assert confirmed.entry["确认状态"] == "已确认"
+
+        adopted = fb_router.adopt_run(
+            "PR-HTTP", receipt, ConfirmPayload(confirm_time="t4"))
+        assert adopted.ok is True
+
+        runs = fb_router.list_runs(decision_no="PR-HTTP")
+        assert runs["total"] == 2
+        assert {r["确认状态"] for r in runs["items"]} == {"已失败", "已采用"}
+
+    def test_http_metric_trace_endpoint(self, fresh_store):
+        from app.routers import fallback_run as fb_router
+
+        # seed 中 sftp-node-03 的 PR-002 已带 FR-001/FR-002 台账
+        metric_svc = SERVICES["parse_metric"]
+        metric_svc.settle_reading("PM-TRACE", "20260901", "sftp-node-03", "t")
+        data = fb_router.trace_reading("PM-TRACE")
+        assert data["已采用数"] >= 1
+        assert any(r["运行回执编号"] == "FR-002" for r in data["运行回执"])
+
+
+class TestRouteEngineAttemptLedger:
+    def test_engine_records_attempts_with_distinct_credentials(self):
+        engine = ParserRouteEngine()
+        engine.register_parsers("csv-utf8", ["csv_parser_v2", "csv_parser_v1"])
+        engine.route("PR-E1", "FI-E1", "csv-utf8", "basis", "t1")
+        ok, _msg, decision = engine.execute_with_fallback(
+            "PR-E1", lambda p: p == "csv_parser_v1", "t2")
+        assert ok is True and decision.fallback_count == 1
+        assert len(decision.attempts) == 2
+        assert decision.attempts[0].success is False
+        assert decision.attempts[1].confirm_state == "已确认"
+        credentials = {a.input_credential for a in decision.attempts}
+        assert len(credentials) == 2
+        view = engine.reconcile("PR-E1")
+        assert view["not_started"] == []
+        assert len(view["failed_attempts"]) == 1
+
+    def test_engine_reconcile_shows_not_started_candidates(self):
+        engine = ParserRouteEngine()
+        engine.register_parsers("csv-utf8", ["csv_parser_v2", "csv_parser_v1", "generic_delimiter"])
+        engine.route("PR-E2", "FI-E2", "csv-utf8", "basis", "t1")
+        engine.execute_with_fallback("PR-E2", lambda p: p == "csv_parser_v2", "t2")
+        view = engine.reconcile("PR-E2")
+        assert view["not_started"] == ["csv_parser_v1", "generic_delimiter"]
